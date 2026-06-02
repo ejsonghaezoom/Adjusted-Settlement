@@ -22,20 +22,59 @@ def get_google_credentials(creds_dict: dict):
     """
     return Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
 
-def read_google_sheet(url: str, creds_dict: dict, tab_name: str = '고객정산금(일별)') -> pd.DataFrame:
+def read_google_sheet(url: str, creds_dict: dict, tab_name: str = '고객 정산금(일별)') -> pd.DataFrame:
     """
     주어진 구글 시트 URL에서 특정 탭의 데이터를 읽어옵니다.
+    (사용자 요청에 따라 3번째 행부터 컬럼 제목으로 인식하고, 4번째 행부터 데이터를 읽어옵니다.)
     """
     creds = get_google_credentials(creds_dict)
     client = gspread.authorize(creds)
     
     # URL에서 스프레드시트 열기
     sheet = client.open_by_url(url)
-    worksheet = sheet.worksheet(tab_name)
     
-    data = worksheet.get_all_records()
-    return pd.DataFrame(data)
-
+    try:
+        worksheet = sheet.worksheet(tab_name)
+    except gspread.exceptions.WorksheetNotFound:
+        try:
+            alt_name = '고객정산금(일별)' if tab_name == '고객 정산금(일별)' else '고객 정산금(일별)'
+            worksheet = sheet.worksheet(alt_name)
+        except gspread.exceptions.WorksheetNotFound:
+            worksheet = sheet.get_worksheet(0)
+    
+    # 전체 데이터를 리스트 형식으로 가져옵니다.
+    all_values = worksheet.get_all_values()
+    
+    # 안전장치: 데이터가 3줄보다 적으면 빈 데이터프레임 반환
+    if len(all_values) < 3:
+        return pd.DataFrame()
+        
+    # [핵심 수정] 3번째 행(파이썬 인덱스 기준 2)을 컬럼 제목(헤더)으로 지정합니다.
+    raw_headers = all_values[2]
+    processed_headers = []
+    
+    for i, h in enumerate(raw_headers):
+        h_str = str(h).strip()
+        if not h_str:
+            processed_headers.append(f"빈컬럼_{i}")
+        else:
+            processed_headers.append(h_str)
+            
+    # 제목 중복 방지 로직
+    final_headers = []
+    seen_counts = {}
+    for h in processed_headers:
+        if h in seen_counts:
+            seen_counts[h] += 1
+            final_headers.append(f"{h}_{seen_counts[h]}")
+        else:
+            seen_counts[h] = 0
+            final_headers.append(h)
+            
+    # [핵심 수정] 실제 데이터는 4번째 행(파이썬 인덱스 기준 3)부터 끝까지 가져옵니다.
+    df = pd.DataFrame(all_values[3:], columns=final_headers)
+    return df
+    
 def upload_to_drive(file_path: str, folder_id: str, creds_dict: dict) -> str:
     """
     파일을 Google Drive의 특정 폴더에 업로드하고 파일 ID 반환
@@ -88,8 +127,6 @@ def send_email_via_gmail(sender: str, to: str, subject: str, body: str, attachme
     """
     Gmail API를 통해 이메일을 발송합니다.
     """
-    # 서비스 계정에 Domain-Wide Delegation이 설정되어 있고 subject(sender)를 지정하는 것이 원칙이나,
-    # 여기서는 간단히 인증된 계정 자신(me)을 발송자로 사용합니다.
     creds = get_google_credentials(creds_dict)
     service = build('gmail', 'v1', credentials=creds)
     
