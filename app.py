@@ -1,9 +1,13 @@
 import streamlit as st
 import os
 import traceback
+import base64
+import json
 from calc_engine import SettlementCalcEngine
 from doc_engine import DocumentGenerator
 from mail_engine import AutomationMailEngine
+from streamlit_oauth import OAuth2Component
+from google.oauth2.credentials import Credentials
 
 def apply_haezoom_theme():
     st.markdown("""
@@ -24,41 +28,96 @@ def apply_haezoom_theme():
             background-color: #E56000;
             color: white;
         }
+        /* 💡 입력창과 텍스트 영역의 글자 색상을 어두운 색(#212529)으로 강제 지정 */
         .stTextInput>div>div>input, .stTextArea>div>div>textarea {
             background-color: var(--bg-light);
             border: 1px solid #E0E0E0;
+            color: #212529 !important; 
         }
         </style>
     """, unsafe_allow_html=True)
 
+def decode_id_token(id_token):
+    try:
+        parts = id_token.split('.')
+        if len(parts) != 3:
+            return None
+        payload = parts[1]
+        padded = payload + '=' * (4 - len(payload) % 4)
+        decoded = base64.b64decode(padded).decode('utf-8')
+        return json.loads(decoded).get('email')
+    except Exception:
+        return None
+
 def verify_google_auth():
-    user_email = st.session_state.get('user_email')
+    # Load secrets
+    try:
+        client_id = st.secrets["google_credentials"]["client_id"]
+        client_secret = st.secrets["google_credentials"]["client_secret"]
+        redirect_uri = st.secrets["google_credentials"]["redirect_uri"]
+    except KeyError:
+        st.error("⚠️ `.streamlit/secrets.toml`에 Google OAuth 자격 증명이 설정되지 않았습니다.")
+        st.stop()
+
+    AUTHORIZE_URL = "https://accounts.google.com/o/oauth2/v2/auth"
+    TOKEN_URL = "https://oauth2.googleapis.com/token"
+    REVOKE_URL = "https://oauth2.googleapis.com/revoke"
+
+    # Initialize OAuth2 component
+    oauth2 = OAuth2Component(client_id, client_secret, AUTHORIZE_URL, TOKEN_URL, TOKEN_URL, REVOKE_URL)
+
+    if "token" not in st.session_state:
+        st.warning("Google Workspace 로그인이 필요합니다.")
+        result = oauth2.authorize_button(
+            name="Google 계정으로 로그인",
+            icon="https://www.google.com/favicon.ico",
+            redirect_uri=redirect_uri,
+            scope="openid email profile https://www.googleapis.com/auth/drive https://www.googleapis.com/auth/gmail.send",
+            key="google_oauth",
+            use_container_width=True
+        )
+
+        if result and "token" in result:
+            st.session_state["token"] = result["token"]
+            st.rerun()
+        st.stop()
+    
+    # Retrieve email from ID token
+    token = st.session_state["token"]
+    user_email = decode_id_token(token.get("id_token", ""))
     
     if not user_email:
-        st.warning("Google Workspace 로그인이 필요합니다.")
-        email_input = st.text_input("해줌 계정 입력 (Mock 로그인)", placeholder="예: user@haezoom.com")
-        if st.button("로그인"):
-            st.session_state['user_email'] = email_input
-            st.rerun()
+        st.error("로그인 정보를 파악할 수 없습니다. 다시 로그인해주세요.")
+        del st.session_state["token"]
         st.stop()
         
     if not user_email.endswith("@haezoom.com"):
-        st.error("🚨 접근 거부: 해줌 사내 계정(@haezoom.com)만 접근 가능합니다.")
+        st.error(f"🚨 접근 거부: 해줌 사내 계정(@haezoom.com)만 접근 가능합니다. (현재 계정: {user_email})")
+        del st.session_state["token"]
         st.stop()
         
-    return user_email
+    # Generate Google Credentials object
+    creds = Credentials(
+        token=token["access_token"],
+        refresh_token=token.get("refresh_token"),
+        token_uri=TOKEN_URL,
+        client_id=client_id,
+        client_secret=client_secret
+    )
+    
+    return user_email, creds
 
 def main():
     st.set_page_config(page_title="해줌 수정정산 관리", page_icon="⚡", layout="wide")
     apply_haezoom_theme()
-    user_email = verify_google_auth()
+    
+    user_email, google_creds = verify_google_auth()
     
     st.title("⚡ 해줌 전력거래대금 수정정산 관리")
     st.caption(f"인증된 사용자: {user_email}")
     
     with st.sidebar:
         st.subheader("📁 양식 다운로드")
-        # 양식 파일이 없으면 템플릿 생성 후 제공
         if not os.path.exists("수정정산_양식.xlsx"):
             import pandas as pd
             with pd.ExcelWriter("수정정산_양식.xlsx") as writer:
@@ -70,6 +129,10 @@ def main():
 
         with open("수정정산_양식.xlsx", "rb") as f:
             st.download_button("📥 기본 양식 다운로드", data=f, file_name="수정정산_양식.xlsx")
+
+        if st.button("로그아웃"):
+            del st.session_state["token"]
+            st.rerun()
 
     with st.form("settlement_form"):
         st.subheader("1. 정산 기본 정보")
@@ -113,8 +176,8 @@ def main():
             doc_engine = DocumentGenerator()
             period_str = f"{start_date.year}년 {start_date.month}월"
             
-            creds_dict = st.secrets["google_credentials"] if "google_credentials" in st.secrets else None
-            mail_engine = AutomationMailEngine(creds_dict)
+            # Use real Google Credentials injected from OAuth
+            mail_engine = AutomationMailEngine(google_creds)
             
             total_plants = len(email_mapping)
             for i, (plant_name, recipient) in enumerate(email_mapping.items()):
@@ -128,11 +191,13 @@ def main():
                 excel_path = doc_engine.generate_excel(plant_name, period_str, daily_diff_dataset)
                 attachments = [pdf_path, excel_path]
                 
-                # 2. 드라이브 업로드
+                # 2. 드라이브 업로드 (실제 API)
+                status.text(f"[{plant_name}] 구글 드라이브 업로드 중...")
                 mail_engine.upload_to_drive(pdf_path, drive_path)
                 mail_engine.upload_to_drive(excel_path, drive_path)
                 
-                # 3. 메일 발송
+                # 3. 메일 발송 (실제 API)
+                status.text(f"[{plant_name}] Gmail 전송 중...")
                 mail_engine.send_settlement_email(
                     sender=sender_email,
                     recipient=recipient,
