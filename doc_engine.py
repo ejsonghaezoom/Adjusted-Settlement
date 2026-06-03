@@ -9,15 +9,32 @@ class DocumentGenerator:
     def __init__(self, output_dir="output_files"):
         self.output_dir = output_dir
         os.makedirs(self.output_dir, exist_ok=True)
-        # Register font if needed (requires a ttf file like malgun.ttf)
-        # pdfmetrics.registerFont(TTFont('Malgun', 'malgun.ttf'))
+        
+        self.font_name = 'Malgun'
+        self.font_loaded = False
+        
+        font_candidates = [
+            r"C:\Windows\Fonts\malgun.ttf",
+            r"C:\Windows\Fonts\malgunbd.ttf",
+            os.path.join(os.path.dirname(__file__), "malgun.ttf")
+        ]
+        
+        for path in font_candidates:
+            if os.path.exists(path):
+                try:
+                    pdfmetrics.registerFont(TTFont(self.font_name, path))
+                    self.font_loaded = True
+                    break
+                except Exception:
+                    pass
 
     def generate_pdf(self, plant_name, period_str, monthly_diff_data):
         file_name = f"{period_str} 수정정산 내역서_{plant_name}.pdf"
         file_path = os.path.join(self.output_dir, file_name)
         
         c = canvas.Canvas(file_path)
-        # c.setFont('Malgun', 12)
+        if self.font_loaded:
+            c.setFont(self.font_name, 12)
         
         c.drawString(50, 800, f"[{plant_name}] {period_str} 수정 정산 내역서")
         c.drawString(50, 770, "작성일: 2026년 06월 02일")
